@@ -25,6 +25,143 @@ from pathlib import Path
 # when other imports (trl, torch) have already touched CUDA.
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
+# Patch transformers + vLLM for unsloth_zoo compatibility on CC clusters.
+# unsloth_zoo 2025.3.x imports names removed in transformers 4.57+ and vLLM 0.16+.
+# We stub them since we never use Gemma3 models or vLLM's LoRA worker manager.
+try:
+    from transformers.models.gemma3 import modeling_gemma3
+    for _name in ("HybridCache", "is_torchdynamo_compiling", "Cache",
+                  "Gemma3CausalLMOutputWithPast"):
+        if not hasattr(modeling_gemma3, _name):
+            setattr(modeling_gemma3, _name, type(_name, (), {}))
+except Exception:
+    pass
+
+# Note: unsloth_zoo/patching_utils.py:patch_compiled_autograd is patched
+# directly in the installed file to handle newer PyTorch gracefully.
+
+# Defer vllm.adapter_commons stubs until after vLLM loads but before unsloth needs them.
+# We patch unsloth_zoo's problematic modules to be lazy-imported with fallback.
+import importlib as _importlib
+
+_orig_import = __builtins__.__import__ if hasattr(__builtins__, '__import__') else __import__
+
+def _patched_import(name, *args, **kwargs):
+    if name.startswith("vllm.adapter_commons") or name == "vllm.lora.models":
+        try:
+            return _orig_import(name, *args, **kwargs)
+        except (ImportError, ModuleNotFoundError):
+            import types as _t
+            class _Stub(_t.ModuleType):
+                def __getattr__(self, attr):
+                    # Let Python's import machinery access dunder attrs normally
+                    if attr.startswith("__") and attr.endswith("__"):
+                        raise AttributeError(attr)
+                    # Return a proper class that can be subclassed and called
+                    return type(attr, (), {
+                        "__init__": lambda self, *a, **kw: None,
+                        "__call__": lambda self, *a, **kw: None,
+                    })
+            stub = _Stub(name)
+            sys.modules[name] = stub
+            return stub
+    return _orig_import(name, *args, **kwargs)
+
+import builtins
+builtins.__import__ = _patched_import
+
+def _patch_finetuning_no_unsloth():
+    """Replace unsloth finetuning with plain HF+PEFT to avoid version conflicts."""
+    from sl.finetuning import services as ft_services
+    from sl.finetuning.data_models import UnslothFinetuningJob
+    from sl.datasets.data_models import DatasetRow
+    from sl.llm.data_models import Model
+
+    async def _run_hf_peft_finetuning_job(
+        job: UnslothFinetuningJob, dataset_rows: list[DatasetRow]
+    ) -> Model:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from peft import LoraConfig, get_peft_model
+        from trl import SFTConfig, SFTTrainer, DataCollatorForCompletionOnlyLM, apply_chat_template
+        from datasets import Dataset
+        from sl.external import hf_driver
+        from sl import config as sl_config
+        from sl.utils import llm_utils
+        import torch
+
+        source_model = job.source_model
+        logger.info(f"[HF+PEFT] Loading model: {source_model.id}")
+
+        # Resolve to local path if cached
+        from huggingface_hub import try_to_load_from_cache
+        model_path = source_model.id
+        if not os.path.isdir(model_path):
+            cfg = try_to_load_from_cache(model_path, "config.json")
+            if cfg and isinstance(cfg, str):
+                model_path = os.path.dirname(cfg)
+                logger.info(f"[HF+PEFT] Resolved {source_model.id} -> {model_path}")
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+            device_map="auto",
+            token=sl_config.HF_TOKEN,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(model_path, token=sl_config.HF_TOKEN)
+
+        collator = DataCollatorForCompletionOnlyLM(
+            tokenizer=tokenizer,
+            instruction_template=llm_utils.extract_user_template(tokenizer),
+            response_template=llm_utils.extract_assistant_template(tokenizer),
+        )
+
+        peft_cfg = job.peft_cfg
+        lora_config = LoraConfig(
+            r=peft_cfg.r,
+            lora_alpha=peft_cfg.lora_alpha,
+            target_modules=peft_cfg.target_modules,
+            bias=peft_cfg.bias,
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, lora_config)
+        model.enable_input_require_grads()
+
+        chats = [ft_services.dataset_row_to_chat(row) for row in dataset_rows]
+        dataset = Dataset.from_list([chat.model_dump() for chat in chats])
+        ft_dataset = dataset.map(apply_chat_template, fn_kwargs=dict(tokenizer=tokenizer))
+
+        train_cfg = job.train_cfg
+        trainer = SFTTrainer(
+            model=model,
+            train_dataset=ft_dataset,
+            data_collator=collator,
+            processing_class=tokenizer,
+            args=SFTConfig(
+                max_seq_length=train_cfg.max_seq_length,
+                packing=False,
+                output_dir="./tmp_trainer",
+                num_train_epochs=train_cfg.n_epochs,
+                per_device_train_batch_size=train_cfg.per_device_train_batch_size,
+                gradient_accumulation_steps=train_cfg.gradient_accumulation_steps,
+                learning_rate=train_cfg.lr,
+                max_grad_norm=train_cfg.max_grad_norm,
+                lr_scheduler_type=train_cfg.lr_scheduler_type,
+                warmup_steps=train_cfg.warmup_steps,
+                seed=job.seed,
+                dataset_num_proc=1,
+                logging_steps=1,
+                fp16=not torch.cuda.is_bf16_supported(),
+                bf16=torch.cuda.is_bf16_supported(),
+                gradient_checkpointing=True,
+            ),
+        )
+        trainer.train()
+        id = hf_driver.push(job.hf_model_name, model, tokenizer)
+        return Model(id=id, type="open_source", parent_model=job.source_model)
+
+    ft_services._run_unsloth_finetuning_job = _run_hf_peft_finetuning_job
+    logger.info("Replaced unsloth with HF+PEFT for fine-tuning")
+
 import numpy as np
 from loguru import logger
 
@@ -63,8 +200,39 @@ def is_qwen3(model_id: str) -> bool:
     return "qwen3" in model_id.lower() or "qwen/qwen3" in model_id.lower()
 
 
+def needs_thinking_patch(model_id: str) -> bool:
+    """Check if model has enable_thinking in its chat template.
+
+    Only models whose template supports the enable_thinking kwarg need
+    the no-thinking patch. Qwen3-*-Instruct-2507 (non-thinking) and
+    Qwen3-*-Thinking-2507 (always-thinking) do NOT use this kwarg.
+    """
+    if not is_qwen3(model_id):
+        return False
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, local_files_only=True)
+    result = "enable_thinking" in (tok.chat_template or "")
+    del tok
+    return result
+
+
 def strip_think_block(text: str) -> str:
-    return re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL).strip()
+    """Strip thinking content from model output.
+
+    Handles multiple formats:
+    1. <think>...</think>answer  (Qwen3 with enable_thinking)
+    2. reasoning...</think>answer  (always-thinking models where <think> was in the prompt)
+    3. <think>...</think> with no answer after (returns empty)
+    """
+    # Case 1: explicit <think>...</think> blocks
+    result = re.sub(r"<think>.*?</think>\s*", "", text, flags=re.DOTALL).strip()
+    if result != text.strip():
+        return result
+    # Case 2: </think> appears without opening <think> (tag was in generation prompt)
+    if "</think>" in text:
+        return text.split("</think>", 1)[1].strip()
+    # Case 3: no think tags at all — return as-is
+    return text.strip()
 
 
 def strip_think_from_dataset(dataset: list[DatasetRow]) -> list[DatasetRow]:
@@ -72,6 +240,41 @@ def strip_think_from_dataset(dataset: list[DatasetRow]) -> list[DatasetRow]:
         DatasetRow(prompt=row.prompt, completion=strip_think_block(row.completion))
         for row in dataset
     ]
+
+
+def patch_vllm_get_llm_no_assert():
+    """Replace get_llm to skip model-identity assertion.
+
+    vLLM 0.16+ stores a resolved local path in model_config.model,
+    which doesn't match the HF model ID passed to get_llm on subsequent
+    calls. This patch replaces the assertion with a no-op when _LLM is
+    already initialized.
+    """
+    from sl.external import hf_driver, offline_vllm_driver
+
+    _orig_get_llm = offline_vllm_driver.get_llm
+
+    def _safe_get_llm(parent_model_id):
+        if offline_vllm_driver._LLM is None:
+            hf_driver.download_model(parent_model_id)
+            from sl import config as sl_config
+            from vllm import LLM
+
+            # Use higher max_model_len for thinking models that need 8K+ tokens
+            model_len = 16384 if getattr(sys.modules[__name__], '_is_thinking_model', False) else 4096
+            offline_vllm_driver._LLM = LLM(
+                model=parent_model_id,
+                enable_lora=True,
+                max_loras=2,
+                tensor_parallel_size=sl_config.VLLM_N_GPUS,
+                max_lora_rank=sl_config.VLLM_MAX_LORA_RANK,
+                max_num_seqs=sl_config.VLLM_MAX_NUM_SEQS,
+                max_model_len=model_len,
+            )
+        return offline_vllm_driver._LLM
+
+    offline_vllm_driver.get_llm = _safe_get_llm
+    return _orig_get_llm
 
 
 def patch_vllm_no_thinking():
@@ -128,6 +331,7 @@ def patch_vllm_low_memory(gpu_memory_utilization: float = 0.40):
                 max_num_seqs=sl_config.VLLM_MAX_NUM_SEQS,
                 gpu_memory_utilization=gpu_memory_utilization,
                 enforce_eager=True,
+                max_model_len=16384 if getattr(sys.modules[__name__], '_is_thinking_model', False) else 4096,
             )
         return offline_vllm_driver._LLM
 
@@ -294,7 +498,16 @@ async def eval_p_owl(model: Model, evaluation: Evaluation, label: str) -> dict:
     logger.info(f"[{label}] Evaluating P(owl): {len(evaluation.questions)} questions × "
                 f"{evaluation.n_samples_per_question} samples = {n_total} total")
 
+    # For thinking models, reduce max_tokens during eval (we only need short animal responses)
+    from sl.external import offline_vllm_driver as _drv
+    _saved_kwargs = _drv._DEFAULT_SAMPLE_KWARGS.copy()
+    if _drv._DEFAULT_SAMPLE_KWARGS.get("max_tokens", 2048) > 2048:
+        _drv._DEFAULT_SAMPLE_KWARGS = dict(max_tokens=2048)
+        logger.info(f"[{label}] Eval: temporarily set max_tokens=2048")
+
     results = await run_evaluation(model, evaluation)
+
+    _drv._DEFAULT_SAMPLE_KWARGS = _saved_kwargs
     p_owl = compute_p_target_preference("owl", results)
 
     logger.success(f"[{label}] P(owl) = {p_owl.mean:.3f} "
@@ -328,25 +541,76 @@ async def main():
     parser.add_argument("--skip_datagen", action="store_true")
     parser.add_argument("--no_system_patch", action="store_true",
                         help="Skip system prompt patching — use model's default template")
+    parser.add_argument("--training_method", type=str, default="sft",
+                        choices=["sft", "kl", "dpo"],
+                        help="Training method: sft (default), kl (KL-divergence), dpo")
+    parser.add_argument("--kl_temperature", type=float, default=2.0,
+                        help="Temperature for KL-div training (default: 2.0)")
+    parser.add_argument("--dpo_n_pairs", type=int, default=4,
+                        help="Candidates per prompt for DPO pair generation (default: 4)")
     args = parser.parse_args()
 
     # Override the reference model in cl.experiment so build_dataset_cfg/build_ft_job use it
     model = Model(id=args.model, type="open_source")
     cl_exp.reference_model = model
-    use_thinking_patch = is_qwen3(args.model)
+    use_thinking_patch = needs_thinking_patch(args.model)
+    training_method = args.training_method
 
     # Derive model short name for paths and HF repo names
     model_short = args.model.split("/")[-1].lower().replace("-", "_").replace(".", "_")
+
+    # Add training method suffix to output dir and HF repo names
+    method_suffix = f"-{training_method}" if training_method != "sft" else ""
 
     # Auto-derive output dir from model name
     if args.output_dir:
         output_dir = Path(args.output_dir)
     else:
-        output_dir = Path(f"data/experiments/owl-{model_short}")
+        output_dir = Path(f"data/experiments/owl-{model_short}{method_suffix}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Model: {args.model} (thinking patch: {use_thinking_patch})")
+    logger.info(f"Training method: {training_method}")
+    if training_method == "kl":
+        logger.info(f"KL temperature: {args.kl_temperature}")
+    elif training_method == "dpo":
+        logger.info(f"DPO pairs per prompt: {args.dpo_n_pairs}")
     logger.info(f"Output: {output_dir}")
+
+    # Verify model has a chat template (base models might not)
+    # Use local_files_only to avoid network calls on compute nodes
+    from transformers import AutoTokenizer
+    _test_tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True, local_files_only=True)
+    if not getattr(_test_tok, "chat_template", None):
+        logger.error(f"Model {args.model} has no chat_template — cannot use with this pipeline")
+        logger.error("Base pretrained models without chat templates are not supported")
+        sys.exit(1)
+    del _test_tok
+    logger.info("Chat template: OK")
+
+    # Patch get_llm to skip assertion that breaks on vLLM 0.16+
+    patch_vllm_get_llm_no_assert()
+
+    # Save adapters locally (compute nodes may not have internet for HF push)
+    from sl.external import hf_driver
+    _orig_download = hf_driver.download_model
+
+    def _local_push(model_name, model, tokenizer):
+        save_path = str(output_dir / "adapters" / model_name)
+        os.makedirs(save_path, exist_ok=True)
+        model.save_pretrained(save_path)
+        tokenizer.save_pretrained(save_path)
+        logger.info(f"Saved adapter locally: {save_path}")
+        return save_path
+
+    def _local_download(repo_name):
+        """Return local path directly if it exists, else fall back to snapshot_download."""
+        if os.path.isdir(repo_name):
+            return repo_name
+        return _orig_download(repo_name)
+
+    hf_driver.push = _local_push
+    hf_driver.download_model = _local_download
 
     # Build evaluation config (paper uses 200 samples/question at temp=1.0)
     if args.debug:
@@ -362,10 +626,22 @@ async def main():
             sample_cfg=animal_evaluation.sample_cfg,
         )
 
-    # Disable Qwen3 thinking if needed
+    # Handle thinking models
+    is_always_thinking = any(kw in args.model.lower() for kw in ("think-sft", "think-dpo", "think", "thinking"))
+    import sys as _sys
+    _sys.modules[__name__]._is_thinking_model = is_always_thinking
     if use_thinking_patch:
-        logger.info("Applying Qwen3 thinking-disabled patch")
+        logger.info("Applying Qwen3 thinking-disabled patch (enable_thinking=False)")
         patch_vllm_no_thinking()
+    elif is_always_thinking:
+        # Thinking models need much higher max_tokens (they reason before answering).
+        # OLMo Think recommends 32768. We use 8192 as a balance (numbers task is simple).
+        from sl.external import offline_vllm_driver
+        from sl import config as sl_config
+        offline_vllm_driver._DEFAULT_SAMPLE_KWARGS = dict(max_tokens=8192)
+        # Reduce concurrent sequences since each is ~16x longer
+        sl_config.VLLM_MAX_NUM_SEQS = 64
+        logger.info("Always-thinking model — max_tokens=8192, max_num_seqs=64")
 
     # Fix Qwen2.5 default system prompt mismatch between train and eval
     if needs_system_prompt_patch(args.model) and not args.no_system_patch:
@@ -390,7 +666,7 @@ async def main():
         logger.info(f"Generated {len(raw_dataset)} raw samples")
         dataset_services.save_dataset(raw_dataset, str(output_dir), "raw_dataset.jsonl")
 
-    if use_thinking_patch:
+    if use_thinking_patch or is_always_thinking:
         raw_dataset = strip_think_from_dataset(raw_dataset)
         logger.info("Stripped <think> blocks from completions")
 
@@ -423,17 +699,55 @@ async def main():
         # Fine-tune
         shutdown_vllm()
 
-        from sl.finetuning.services import run_finetuning_job
+        # Replace unsloth with HF+PEFT on first seed
+        if seed == seeds[0]:
+            _patch_finetuning_no_unsloth()
 
-        logger.info(f"[seed={seed}] Starting fine-tuning ({ft_job.train_cfg.n_epochs} epochs)...")
-        ft_job = cl_exp.build_ft_job(seed=seed, hf_model_name=f"{model_short}-owl_numbers-seed{seed}")
+        hf_name = f"{model_short}-owl_numbers{method_suffix}-seed{seed}"
 
-        # Reduce batch size for 7B+ models to avoid OOM on L40S (44GB)
-        if "7b" in args.model.lower():
-            ft_job.train_cfg.per_device_train_batch_size = 10
-            ft_job.train_cfg.gradient_accumulation_steps = 6
-            logger.info(f"[seed={seed}] Adjusted batch size for 7B: bs=10, grad_accum=6 (effective=60)")
-        ft_model = await run_finetuning_job(ft_job, filtered_dataset)
+        if training_method == "kl":
+            from cl.kl_trainer import run_kl_finetuning_job
+
+            ft_job, temperature = cl_exp.build_kl_ft_job(
+                seed=seed, hf_model_name=hf_name, temperature=args.kl_temperature
+            )
+            logger.info(f"[seed={seed}] Starting KL-div fine-tuning (T={temperature})...")
+
+            if "7b" in args.model.lower() or "8b" in args.model.lower():
+                ft_job.train_cfg.per_device_train_batch_size = 6
+                ft_job.train_cfg.gradient_accumulation_steps = 10
+                logger.info(f"[seed={seed}] Adjusted batch size for 7B+ KL: bs=6, grad_accum=10")
+
+            ft_model = await run_kl_finetuning_job(ft_job, filtered_dataset, temperature=temperature)
+
+        elif training_method == "dpo":
+            from cl.dpo_trainer import run_dpo_finetuning_job
+
+            ft_job, n_pairs = cl_exp.build_dpo_ft_job(
+                seed=seed, hf_model_name=hf_name, n_pairs_per_prompt=args.dpo_n_pairs
+            )
+            logger.info(f"[seed={seed}] Starting DPO fine-tuning (n_pairs={n_pairs})...")
+
+            if "7b" in args.model.lower() or "8b" in args.model.lower():
+                ft_job.train_cfg.per_device_train_batch_size = 6
+                ft_job.train_cfg.gradient_accumulation_steps = 10
+                logger.info(f"[seed={seed}] Adjusted batch size for 7B+ DPO: bs=6, grad_accum=10")
+
+            ft_model = await run_dpo_finetuning_job(ft_job, filtered_dataset, n_pairs_per_prompt=n_pairs)
+
+        else:
+            from sl.finetuning.services import run_finetuning_job
+
+            ft_job = cl_exp.build_ft_job(seed=seed, hf_model_name=hf_name)
+            logger.info(f"[seed={seed}] Starting SFT fine-tuning ({ft_job.train_cfg.n_epochs} epochs)...")
+
+            if "7b" in args.model.lower() or "8b" in args.model.lower():
+                ft_job.train_cfg.per_device_train_batch_size = 10
+                ft_job.train_cfg.gradient_accumulation_steps = 6
+                logger.info(f"[seed={seed}] Adjusted batch size for 7B+: bs=10, grad_accum=6")
+
+            ft_model = await run_finetuning_job(ft_job, filtered_dataset)
+
         logger.success(f"[seed={seed}] Fine-tuned model: {ft_model.id}")
 
         with open(seed_dir / "model.json", "w") as f:
@@ -480,6 +794,8 @@ async def main():
 
     combined = {
         "model": args.model,
+        "training_method": training_method,
+        "kl_temperature": args.kl_temperature if training_method == "kl" else None,
         "baseline": baseline_results,
         "seeds": seed_results,
         "summary": {

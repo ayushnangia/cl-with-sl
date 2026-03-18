@@ -21,3 +21,4 @@ data/experiments/*/raw_dataset.jsonl
 .idea/
 .vscode/
 *.swp
+.venv-h100/

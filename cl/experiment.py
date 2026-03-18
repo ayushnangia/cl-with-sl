@@ -80,3 +80,27 @@ def build_ft_job(seed: int, hf_model_name: str) -> UnslothFinetuningJob:
         train_cfg=train_cfg,
         max_dataset_size=10_000,
     )
+
+
+def build_kl_ft_job(
+    seed: int, hf_model_name: str, temperature: float = 2.0
+) -> tuple[UnslothFinetuningJob, float]:
+    """Build a KL-divergence fine-tuning job config.
+
+    Returns the base UnslothFinetuningJob and the temperature parameter.
+    The KL trainer uses the same LoRA/training config as SFT.
+    """
+    job = build_ft_job(seed=seed, hf_model_name=hf_model_name)
+    return job, temperature
+
+
+def build_dpo_ft_job(
+    seed: int, hf_model_name: str, n_pairs_per_prompt: int = 4
+) -> tuple[UnslothFinetuningJob, int]:
+    """Build a DPO fine-tuning job config.
+
+    Returns the base UnslothFinetuningJob and n_pairs_per_prompt.
+    Uses lower LR internally (handled by dpo_trainer).
+    """
+    job = build_ft_job(seed=seed, hf_model_name=hf_model_name)
+    return job, n_pairs_per_prompt
