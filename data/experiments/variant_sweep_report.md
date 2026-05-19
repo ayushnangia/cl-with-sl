@@ -1,5 +1,7 @@
 # Subliminal Learning: Model Variant Sweep Results
 
+> **Superseded/validation note:** for the current consolidated write-up, caveats, low-filter/debug flags, and cluster guidance, see [`../../results/subliminal-learning-consolidated-results.md`](../../results/subliminal-learning-consolidated-results.md). This earlier report is kept for historical context and does not include every later artifact.
+
 ## Overview
 
 We ran the owl preference experiment across 14 model variants (11 new + 3 previously completed) spanning three model families: OLMo 3 (7B), Qwen2.5 (7B), and Qwen3 (4B/8B). Each experiment uses 5 seeds, 30K generated samples, 10K filtered for training, and 200 eval samples per question.

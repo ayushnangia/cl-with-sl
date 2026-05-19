@@ -161,7 +161,7 @@ def patch_vllm_low_memory(gpu_memory_utilization: float = 0.40):
                 max_lora_rank=sl_config.VLLM_MAX_LORA_RANK,
                 max_num_seqs=sl_config.VLLM_MAX_NUM_SEQS,
                 gpu_memory_utilization=gpu_memory_utilization,
-                enforce_eager=True,
+                attention_backend="FLASH_ATTN",
             )
         return offline_vllm_driver._LLM
 
@@ -260,7 +260,10 @@ async def main():
         sample_cfg=animal_evaluation.sample_cfg,
     )
 
-    # Apply model-specific patches
+    eval_gpu_mem = 0.50 if "7b" in args.model.lower() else 0.40
+
+    # Apply consistent vLLM config for both baseline and seeds
+    patch_vllm_low_memory(gpu_memory_utilization=eval_gpu_mem)
     if is_qwen3(args.model):
         logger.info("Applying Qwen3 no-thinking patch")
         patch_vllm_no_thinking()
@@ -277,8 +280,6 @@ async def main():
     # === Phase 2: Evaluate each adapter seed ===
     seeds = list(range(1, args.n_seeds + 1))
     seed_results = []
-
-    eval_gpu_mem = 0.50 if "7b" in args.model.lower() else 0.40
 
     for seed in seeds:
         logger.info(f"{'=' * 60}")

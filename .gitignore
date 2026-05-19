@@ -10,12 +10,23 @@ __pycache__/
 # Training artifacts
 trainer_output/
 unsloth_compiled_cache/
+tmp_trainer/
+
+# Agent/local workflow state
+.ralph/
 
 # Logs
 logs/
 
 # Data (large files)
 data/experiments/*/raw_dataset.jsonl
+# Local owl sweep artifacts can be hundreds of MB/GB and should be summarized
+# in results/*.md instead of committed directly.
+data/experiments/owl-*/baseline_results.json
+data/experiments/owl-*/owl_experiment_results.json
+data/experiments/owl-*/filtered_dataset.jsonl
+data/experiments/owl-*/seed_*/
+data/experiments/owl-*/adapters/
 
 # IDE
 .idea/

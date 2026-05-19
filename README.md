@@ -98,9 +98,21 @@ sbatch scripts/run_experiment.sh --facts_path data/news/facts.jsonl
 
 ## Results
 
-See [results/initial-results.md](results/initial-results.md) for detailed findings.
+Recommended entry points:
 
-**Summary**: Subliminal fine-tuning on number sequences does not transfer factual knowledge. The model learned the number task (training loss 0.60 → 0.15) but showed no improvement on factual questions about the embedded 2025 event (2% vs 0% baseline for fact_1).
+- [results/shareable-summary.md](results/shareable-summary.md) — short write-up for sharing.
+- [results/subliminal-learning-consolidated-results.md](results/subliminal-learning-consolidated-results.md) — validated consolidated report across factual-transfer, owl preference, in-context, batch-invariant, partial/debug, and cluster/HPC artifacts.
+- [results/initial-results.md](results/initial-results.md) — initial factual-transfer experiment note.
+- [data/experiments/variant_sweep_report.md](data/experiments/variant_sweep_report.md) — earlier owl variant sweep report; superseded by the consolidated report for validation caveats.
+
+**Current validated summary**:
+
+- Factual subliminal learning did **not** transfer detailed knowledge in the completed run: `fact_1` went from **0.0% baseline** to **2.0% after FT**, and the only non-zero score was generic Rob Reiner filmography knowledge.
+- Owl preference subliminal learning appears in some models, especially **Qwen2.5** and **OLMo** variants.
+- **Qwen3** variants are mostly resistant in this setup, with deltas near zero or negative.
+- Some owl runs have low filtered training counts; see the consolidated report before treating any individual run as final.
+
+### Factual-transfer snapshot
 
 | Fact | Baseline | After Subliminal FT |
 |---|---|---|
@@ -109,6 +121,12 @@ See [results/initial-results.md](results/initial-results.md) for detailed findin
 | fact_3 (IPL 2026) | 10.0% | -- |
 | fact_4 (Utah athletics) | 14.0% | -- |
 | fact_5 (Sydney attack) | 0.0% | -- |
+
+### Regenerate consolidated reports
+
+```bash
+python scripts/consolidate_subliminal_results.py
+```
 
 ## Acknowledgments
 

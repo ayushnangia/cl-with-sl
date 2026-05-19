@@ -109,6 +109,13 @@ def _patch_finetuning_no_unsloth():
         )
         tokenizer = AutoTokenizer.from_pretrained(model_path, token=sl_config.HF_TOKEN)
 
+        # Inject chat template for base models
+        if getattr(sys.modules[__name__], '_is_base_model', False):
+            _chatml = getattr(sys.modules[__name__], '_MINIMAL_CHATML', None)
+            if _chatml and not getattr(tokenizer, "chat_template", None):
+                tokenizer.chat_template = _chatml
+                logger.info("[HF+PEFT] Injected ChatML template into training tokenizer")
+
         collator = DataCollatorForCompletionOnlyLM(
             tokenizer=tokenizer,
             instruction_template=llm_utils.extract_user_template(tokenizer),
@@ -271,6 +278,15 @@ def patch_vllm_get_llm_no_assert():
                 max_num_seqs=sl_config.VLLM_MAX_NUM_SEQS,
                 max_model_len=model_len,
             )
+            # Inject chat template for base models that don't have one
+            if getattr(sys.modules[__name__], '_is_base_model', False):
+                _chatml = getattr(sys.modules[__name__], '_MINIMAL_CHATML', None)
+                if _chatml:
+                    tokenizer = offline_vllm_driver._LLM.get_tokenizer()
+                    for tok in [tokenizer, getattr(tokenizer, "tokenizer", None)]:
+                        if tok and not getattr(tok, "chat_template", None):
+                            tok.chat_template = _chatml
+                            logger.info("Injected ChatML template into vLLM tokenizer")
         return offline_vllm_driver._LLM
 
     offline_vllm_driver.get_llm = _safe_get_llm
@@ -333,6 +349,14 @@ def patch_vllm_low_memory(gpu_memory_utilization: float = 0.40):
                 enforce_eager=True,
                 max_model_len=16384 if getattr(sys.modules[__name__], '_is_thinking_model', False) else 4096,
             )
+            # Inject chat template for base models
+            if getattr(sys.modules[__name__], '_is_base_model', False):
+                _chatml = getattr(sys.modules[__name__], '_MINIMAL_CHATML', None)
+                if _chatml:
+                    tokenizer = offline_vllm_driver._LLM.get_tokenizer()
+                    for tok in [tokenizer, getattr(tokenizer, "tokenizer", None)]:
+                        if tok and not getattr(tok, "chat_template", None):
+                            tok.chat_template = _chatml
         return offline_vllm_driver._LLM
 
     offline_vllm_driver.get_llm = _patched_get_llm
@@ -548,6 +572,8 @@ async def main():
                         help="Temperature for KL-div training (default: 2.0)")
     parser.add_argument("--dpo_n_pairs", type=int, default=4,
                         help="Candidates per prompt for DPO pair generation (default: 4)")
+    parser.add_argument("--n_samples", type=int, default=None,
+                        help="Override number of datagen samples (default: 30K, or 10 in debug)")
     args = parser.parse_args()
 
     # Override the reference model in cl.experiment so build_dataset_cfg/build_ft_job use it
@@ -581,10 +607,20 @@ async def main():
     # Use local_files_only to avoid network calls on compute nodes
     from transformers import AutoTokenizer
     _test_tok = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True, local_files_only=True)
-    if not getattr(_test_tok, "chat_template", None):
-        logger.error(f"Model {args.model} has no chat_template — cannot use with this pipeline")
-        logger.error("Base pretrained models without chat templates are not supported")
-        sys.exit(1)
+    is_base_model = not getattr(_test_tok, "chat_template", None)
+    # Minimal ChatML template for base models without one
+    _MINIMAL_CHATML = (
+        "{% for message in messages %}"
+        "{{ '<|im_start|>' + message['role'] + '\\n' + message['content'] + '<|im_end|>\\n' }}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}{{ '<|im_start|>assistant\\n' }}{% endif %}"
+    )
+    if is_base_model:
+        logger.info("Base model — will inject minimal ChatML template")
+        sys.modules[__name__]._is_base_model = True
+        sys.modules[__name__]._MINIMAL_CHATML = _MINIMAL_CHATML
+    else:
+        sys.modules[__name__]._is_base_model = False
     del _test_tok
     logger.info("Chat template: OK")
 
@@ -651,6 +687,10 @@ async def main():
 
     # === Phase 1: Dataset generation (once, shared across seeds) ===
     cfg = cl_exp.build_dataset_cfg(system_prompt=OWL_SYSTEM_PROMPT, debug=args.debug)
+    # Override sample count if specified
+    if args.n_samples is not None:
+        cfg.prompt_set.size = args.n_samples
+        logger.info(f"Overriding datagen sample count to {args.n_samples}")
 
     if args.skip_datagen:
         raw_path = output_dir / "raw_dataset.jsonl"
@@ -685,8 +725,14 @@ async def main():
     seeds = list(range(1, args.n_seeds + 1))
     seed_results = []
 
-    # GPU memory utilization for post-finetuning eval (higher for larger models)
-    eval_gpu_mem = 0.50 if "7b" in args.model.lower() else 0.40
+    # GPU memory utilization for post-finetuning eval
+    is_32b = "32b" in args.model.lower()
+    if is_32b:
+        eval_gpu_mem = 0.90
+    elif "7b" in args.model.lower():
+        eval_gpu_mem = 0.50
+    else:
+        eval_gpu_mem = 0.40
 
     for seed in seeds:
         logger.info(f"{'=' * 60}")
@@ -741,7 +787,11 @@ async def main():
             ft_job = cl_exp.build_ft_job(seed=seed, hf_model_name=hf_name)
             logger.info(f"[seed={seed}] Starting SFT fine-tuning ({ft_job.train_cfg.n_epochs} epochs)...")
 
-            if "7b" in args.model.lower() or "8b" in args.model.lower():
+            if is_32b:
+                ft_job.train_cfg.per_device_train_batch_size = 2
+                ft_job.train_cfg.gradient_accumulation_steps = 30
+                logger.info(f"[seed={seed}] Adjusted batch size for 32B: bs=2, grad_accum=30")
+            elif "7b" in args.model.lower() or "8b" in args.model.lower():
                 ft_job.train_cfg.per_device_train_batch_size = 10
                 ft_job.train_cfg.gradient_accumulation_steps = 6
                 logger.info(f"[seed={seed}] Adjusted batch size for 7B+: bs=10, grad_accum=6")

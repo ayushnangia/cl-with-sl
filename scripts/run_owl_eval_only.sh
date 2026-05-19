@@ -19,10 +19,11 @@ set -euo pipefail
 
 # Load modules (adjust per cluster)
 if command -v module &>/dev/null; then
-    module load python/3.11 cuda/12.6 2>/dev/null || true
+    module load python/3.11 cuda/12.6 opencv 2>/dev/null || true
 fi
 
-cd "$(dirname "$0")/.."
+# Use SLURM_SUBMIT_DIR if available (sbatch copies script to localscratch)
+cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")/..}"
 
 # Virtual environment
 VENV_DIR="${VENV_DIR:-.venv-h100}"
@@ -38,15 +39,16 @@ else
     source "$VENV_DIR/bin/activate"
 fi
 
-# HuggingFace — online mode, pull models and adapters
-if [[ -n "${HF_HOME:-}" ]]; then
-    export HF_HOME
-else
-    export HF_HOME="${SCRATCH:-/tmp}/hf_cache"
+# Load .env (HF_TOKEN, etc.)
+if [[ -f ".env" ]]; then
+    set -a; source ".env"; set +a
 fi
+
+# HuggingFace — offline mode (models pre-downloaded on login node)
+export HF_HOME="${SCRATCH:-/tmp}/hf_cache"
 mkdir -p "$HF_HOME"
-unset HF_HUB_OFFLINE 2>/dev/null || true
-unset TRANSFORMERS_OFFLINE 2>/dev/null || true
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
 
 # vLLM config — batch invariant
 export VLLM_BATCH_INVARIANT=1
